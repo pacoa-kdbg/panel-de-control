@@ -167,11 +167,13 @@ def _make_plugin(tmp_path, monkeypatch, smt=None, boost=None, cores=None, freque
     return main.Plugin()
 
 
-def test_flip_ds_lifecycle_leaves_power_and_fans_to_the_system(tmp_path, monkeypatch):
+def test_flip_ds_lifecycle_requires_opt_in_and_restores_tdp(tmp_path, monkeypatch):
     root = str(tmp_path)
     files = {
         "class/dmi/id/sys_vendor": "AYANEO",
         "class/dmi/id/product_name": "FLIP 1S DS",
+        "class/power_supply/ACAD/type": "Mains",
+        "class/power_supply/ACAD/online": "0",
         "class/hwmon/hwmon7/name": "ayaneo_ec",
         "class/hwmon/hwmon7/fan1_input": "3599",
         "class/hwmon/hwmon7/pwm1_enable": "2",
@@ -185,13 +187,50 @@ def test_flip_ds_lifecycle_leaves_power_and_fans_to_the_system(tmp_path, monkeyp
         path.write_text(value)
     (tmp_path / "state.json").write_text(json.dumps({
         "tdp_control_enabled": True, "hhd_tdp_takeover": True, "hhd_tdp_prev": True,
+        "auto_tdp": True, "low_battery_tdp_hold": True,
         "gpu_handoff_pending": True, "fan_release_pending": True,
         "desktop_mode_enabled": True, "desktop_power_mode": "performance",
+    }))
+    (tmp_path / "tdp_profiles.json").write_text(json.dumps({
+        "global": {"watts": 15, "auto_tdp": True},
     }))
 
     plugin = _make_plugin(tmp_path, monkeypatch, fake_tdp=False)
     import main
 
+    monkeypatch.setattr(main, "read_on_ac", lambda: False)
+    original_limits = (28125, 54875, 45375)
+    limits = original_limits
+    rail_writes = []
+
+    def run_ryzenadj(argv, **kwargs):
+        nonlocal limits
+        if argv[1:] == ["-i"]:
+            stdout = "\n".join(
+                f"{name} | {value / 1000:.3f} |"
+                for name, value in zip(
+                    ("STAPM LIMIT", "PPT LIMIT FAST", "PPT LIMIT SLOW"), limits
+                )
+            )
+            return types.SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+        assert argv[1::2] == ["--stapm-limit", "--fast-limit", "--slow-limit"]
+        limits = tuple(map(int, argv[2::2]))
+        assert limits == original_limits or all(0 < value <= 25000 for value in limits)
+        rail_writes.append(limits)
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(
+        main.tdp_factory, "RyzenadjBackend",
+        partial(main.tdp_factory.RyzenadjBackend, runner=run_ryzenadj),
+    )
+    monkeypatch.setattr(
+        main.tdp_factory, "select_backend",
+        partial(main.tdp_factory.select_backend, root=root, ryzenadj_resolve=lambda: "ryzenadj"),
+    )
+    conflict = True
+    monkeypatch.setattr(
+        main.powerstation_conflict.Detector, "tdp_active", lambda self: conflict,
+    )
     detect = main.device_registry.detect
     monkeypatch.setattr(main.device_registry, "detect", partial(detect, root=root))
     for name in ("CoreControl", "SmtControl", "select_boost", "FanReader"):
@@ -212,6 +251,7 @@ def test_flip_ds_lifecycle_leaves_power_and_fans_to_the_system(tmp_path, monkeyp
     monkeypatch.setattr(main.controller_hhd, "set_tdp_enable", reject_write)
 
     async def exercise():
+        nonlocal conflict
         await plugin._main()
         try:
             assert (await plugin.get_device())["key"] == "ayaneo_flip_1s_ds"
@@ -221,12 +261,51 @@ def test_flip_ds_lifecycle_leaves_power_and_fans_to_the_system(tmp_path, monkeyp
             assert [(item["rpm"], item["percent"]) for item in fan["fans"]] == [(3599, None)]
             assert not (await plugin.set_smt(True))["smt"]["supported"]
             assert not (await plugin.set_gpu_clock(600, 1200))["supported"]
-            assert not await plugin.set_tdp_control_enabled(True)
             assert not (await plugin.set_fan_preset("balanced", "global"))["supported"]
+            assert not await plugin.get_tdp_control_enabled()
+            assert "power" in (await plugin.set_ui_module("power", False))["disabled"]
+            assert rail_writes == []
+
+            conflict = False
+            assert "power" not in (await plugin.set_ui_module("power", False))["disabled"]
+            assert await plugin.get_tdp_control_enabled()
+            state = await plugin.get_tdp_state()
+            assert state["supports_auto_tdp"]
+            assert not state["auto_config"]["enabled"]
+            assert state["low_battery_hold"]["available"]
+            assert not state["low_battery_hold"]["enabled"]
+
+            assert (await plugin.set_auto_tdp(True))["auto_tdp"]
+            assert (await plugin.get_tdp_state())["auto_config"]["enabled"]
+            assert not (await plugin.set_auto_tdp(False))["auto_tdp"]
+
+            monkeypatch.setattr(plugin._battery, "read", lambda: {
+                "present": True, "percent": 20, "status": "Discharging",
+            })
+            assert (await plugin.set_tdp_watts(25, "global"))["ok"]
+            assert limits == (25000, 25000, 25000)
+            hold = (await plugin.set_low_battery_tdp_hold(True))["low_battery_hold"]
+            assert hold["enabled"] and hold["active"] and hold["verified"]
+            conflict = True
+            write_count = len(rail_writes)
+            await plugin._offload_call(plugin._tdp_guard_tick)
+            hold = (await plugin.get_tdp_state())["low_battery_hold"]
+            assert not hold["active"] and hold["reason"] == "external_owner"
+            assert len(rail_writes) == write_count
+            conflict = False
+            write_count = len(rail_writes)
+            for setter in (plugin.set_tdp_watts, plugin.apply_power_preset):
+                result = await setter(26, "global")
+                assert not result["ok"]
+                assert result["detail"] == "tdp-request-exceeds-25w-ceiling"
+            assert len(rail_writes) == write_count
         finally:
             await plugin._unload()
 
     asyncio.run(exercise())
+    assert limits == original_limits
+    assert rail_writes[-1] == original_limits
+    assert not (tmp_path / "run/panel-de-control/ryzenadj-ayaneo_flip_1s_ds.lock").exists()
     assert writes == []
     for name, value in files.items():
         assert (tmp_path / "sys" / name).read_text() == value

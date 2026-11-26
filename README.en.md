@@ -128,8 +128,15 @@ OneXPlayer X2 Mini Pro and quite a few others, even desktop PCs, the Steam Machi
 your device isn't on the list, Panel looks at what it can control on it and shows you that.
 
 On Linux, Panel recognizes the **AYANEO FLIP 1S DS** and displays fan RPM when the
-kernel exposes it through `ayaneo_ec`. CPU, GPU, TDP and fan controls remain with
-the system or your existing tools; Panel does not take them over.
+kernel exposes it through `ayaneo_ec`. TDP control is off by default. Disable
+other TDP managers before enabling it in Settings. Auto-TDP and low-battery TDP
+hold each require a separate opt-in; hold is inactive while Auto-TDP is active.
+Panel uses unmodified RyzenAdj and caps its STAPM, fast PPT and slow PPT targets
+at 25 W on battery and AC. It saves the exact limits it reads before taking
+control and can restore them even above 25 W. If the power source changes or
+cannot be confirmed, Panel does not write the saved limits until the original
+power source is confirmed again. This restores a snapshot, not factory defaults.
+CPU, GPU and fan controls remain with the system or your existing tools.
 
 ## 📦 Installation
 
